@@ -1,13 +1,86 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <zlib.h>
-#include <windows.h> // For CreateDirectory and path handling on Windows
+#include <windows.h>
+#include <io.h>
 
-// Function to create directory if it doesn't exist
+#ifdef _WIN32
+#include <fcntl.h>
+#endif
+
+#define VERSION "1.0.0"
+
+typedef struct {
+    long data_offset;
+    unsigned int compressed_size;
+    unsigned int uncompressed_size;
+    unsigned int crc32;
+    int is_extracted;
+    unsigned int last_mod_time;
+    unsigned int last_mod_date;
+} EntryInfo;
+
+typedef struct {
+    unsigned long long uncompressed_size;
+    unsigned long long compressed_size;
+} Zip64Info;
+
+#define MAX_ENTRIES 1000
+
+typedef struct {
+    const char *output_dir;
+    int keep_zip;
+    int force_overwrite;
+    int list_only;
+    int verify_crc;
+    int preserve_time;
+    int verbose;
+    int quiet;
+} Options;
+
+void print_usage(const char *prog_name) {
+    printf("Dezipper v%s - Extract ZIP files and free disk space\n\n", VERSION);
+    printf("Usage: %s [OPTIONS] <zip_file>\n\n", prog_name);
+    printf("Options:\n");
+    printf("  -h, --help        Show this help message\n");
+    printf("  -v, --verbose     Show detailed progress information\n");
+    printf("  -q, --quiet       Suppress non-essential output\n");
+    printf("  -d, --dir <path>  Extract to specified directory\n");
+    printf("  -k, --keep        Keep original ZIP file (don't truncate)\n");
+    printf("  -f, --force       Force overwrite existing files\n");
+    printf("  -l, --list        List contents without extracting\n");
+    printf("  -t, --test        Test archive integrity (verify CRC)\n");
+    printf("  -p, --preserve    Preserve file timestamps (modification time)\n");
+    printf("\nExamples:\n");
+    printf("  %s archive.zip                    Extract to current directory\n", prog_name);
+    printf("  %s -d output_dir archive.zip      Extract to output_dir\n", prog_name);
+    printf("  %s -k archive.zip                 Extract without truncating ZIP\n", prog_name);
+    printf("  %s -l archive.zip                 List contents only\n", prog_name);
+    printf("  %s -t archive.zip                 Test archive integrity\n", prog_name);
+}
+
+void print_progress(const char *filename, unsigned int extracted, unsigned int total, int current, int total_files) {
+    static clock_t last_time = 0;
+    clock_t current_time = clock();
+
+    if (current_time - last_time < CLOCKS_PER_SEC / 2 && current != total_files - 1) {
+        return;
+    }
+
+    double progress = (total > 0) ? (double)extracted / total * 100 : 0;
+    printf("\r[%d/%d] %s: %.1f%% (%u / %u bytes)",
+           current + 1, total_files, filename, progress, extracted, total);
+
+    last_time = current_time;
+}
+
 int create_directory(const char *path) {
     char temp[MAX_PATH];
-    strcpy(temp, path);
+    strncpy(temp, path, MAX_PATH - 1);
+    temp[MAX_PATH - 1] = '\0';
+
     for (char *p = temp + 1; *p; p++) {
         if (*p == '\\' || *p == '/') {
             *p = '\0';
@@ -19,7 +92,7 @@ int create_directory(const char *path) {
             *p = '\\';
         }
     }
-    // Create final directory
+
     if (GetFileAttributes(temp) == INVALID_FILE_ATTRIBUTES) {
         if (!CreateDirectory(temp, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
             return -1;
@@ -28,157 +101,544 @@ int create_directory(const char *path) {
     return 0;
 }
 
-int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <zip_file>\n", argv[0]);
-        return 1;
+void normalize_path(char *path) {
+    for (char *p = *path ? path : NULL; p && *p; p++) {
+        if (*p == '/') *p = '\\';
+    }
+}
+
+int file_exists(const char *path) {
+    return GetFileAttributes(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+unsigned int calculate_crc32(const unsigned char *data, unsigned int size) {
+    return crc32(0L, data, size);
+}
+
+unsigned int dos_to_unix_time(unsigned int dostime, unsigned int dosdate) {
+    struct tm tm_s;
+    tm_s.tm_sec = (dostime & 0x1F) * 2;
+    tm_s.tm_min = (dostime >> 5) & 0x3F;
+    tm_s.tm_hour = (dostime >> 11) & 0x1F;
+    tm_s.tm_mday = dosdate & 0x1F;
+    tm_s.tm_mon = ((dosdate >> 5) & 0x0F) - 1;
+    tm_s.tm_year = ((dosdate >> 9) & 0x7F) + 80;
+    tm_s.tm_isdst = -1;
+
+    return (unsigned int)mktime(&tm_s);
+}
+
+void UnixTimeToFileTime(unsigned int utime, FILETIME *ft);
+
+int set_file_times(const char *path, unsigned int dostime, unsigned int dosdate) {
+    unsigned int unix_time = dos_to_unix_time(dostime, dosdate);
+
+    HANDLE hFile = CreateFile(path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return -1;
     }
 
-    const char *zip_path = argv[1];
-    FILE *zip_file = fopen(zip_path, "r+b");
+    FILETIME ft;
+    UnixTimeToFileTime(unix_time, &ft);
+    SetFileTime(hFile, NULL, NULL, &ft);
+    CloseHandle(hFile);
+    return 0;
+}
+
+unsigned int FileTimeToUnixTime(FILETIME ft) {
+    unsigned long long win_time = ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (unsigned int)((win_time - 116444736000000000ULL) / 10000000);
+}
+
+void UnixTimeToFileTime(unsigned int utime, FILETIME *ft) {
+    unsigned long long win_time = ((unsigned long long)utime * 10000000ULL) + 116444736000000000ULL;
+    ft->dwLowDateTime = (DWORD)(win_time & 0xFFFFFFFF);
+    ft->dwHighDateTime = (DWORD)(win_time >> 32);
+}
+
+int parse_zip64_extra_field(const unsigned char *extra, unsigned int extra_len,
+                            unsigned long long *uncompressed_size, unsigned long long *compressed_size) {
+    while (extra_len >= 4) {
+        unsigned short field_id = extra[0] | (extra[1] << 8);
+        unsigned short field_size = extra[2] | (extra[3] << 8);
+
+        if (field_size > extra_len - 4) break;
+
+        if (field_id == 0x0001) {
+            unsigned int offset = 4;
+            if (field_size >= 8 && offset + 8 <= field_size) {
+                if (uncompressed_size) {
+                    *uncompressed_size = 0;
+                    for (int i = 0; i < 8 && offset + i < field_size; i++) {
+                        *uncompressed_size |= ((unsigned long long)extra[offset + i]) << (i * 8);
+                    }
+                }
+                offset += 8;
+            }
+            if (field_size >= 16 && offset + 8 <= field_size) {
+                if (compressed_size) {
+                    *compressed_size = 0;
+                    for (int i = 0; i < 8 && offset + i < field_size; i++) {
+                        *compressed_size |= ((unsigned long long)extra[offset + i]) << (i * 8);
+                    }
+                }
+            }
+            return 0;
+        }
+
+        extra += 4 + field_size;
+        extra_len -= 4 + field_size;
+    }
+    return -1;
+}
+
+int parse_arguments(int argc, char *argv[], Options *opts, const char **zip_path) {
+    memset(opts, 0, sizeof(Options));
+    opts->verbose = 0;
+    opts->quiet = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return -1;
+        }
+        else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+            opts->verbose = 1;
+        }
+        else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
+            opts->quiet = 1;
+        }
+        else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--dir") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: -d requires a directory argument\n");
+                return -1;
+            }
+            opts->output_dir = argv[++i];
+        }
+        else if (strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--keep") == 0) {
+            opts->keep_zip = 1;
+        }
+        else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--force") == 0) {
+            opts->force_overwrite = 1;
+        }
+        else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--list") == 0) {
+            opts->list_only = 1;
+        }
+        else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--test") == 0) {
+            opts->verify_crc = 1;
+        }
+        else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--preserve") == 0) {
+            opts->preserve_time = 1;
+        }
+        else if (argv[i][0] != '-') {
+            *zip_path = argv[i];
+        }
+        else {
+            fprintf(stderr, "Error: Unknown option '%s'\n", argv[i]);
+            return -1;
+        }
+    }
+
+    if (!*zip_path) {
+        fprintf(stderr, "Error: No ZIP file specified\n\n");
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    return 0;
+}
+
+int list_zip_contents(const char *zip_path, Options *opts) {
+    (void)opts; // Reserved for future use
+    FILE *zip_file = fopen(zip_path, "rb");
     if (!zip_file) {
-        perror("Error opening ZIP file");
+        fprintf(stderr, "Error: Cannot open ZIP file '%s'\n", zip_path);
         return 1;
     }
 
     unsigned char signature[4];
     int entry_count = 0;
+    unsigned long long total_compressed = 0;
+    unsigned long long total_uncompressed = 0;
+
+    printf("Archive: %s\n\n", zip_path);
+    printf("  Length    Compression   Name\n");
+    printf("  --------  ------------   ----------------\n");
+
     while (1) {
-        // Read signature
         if (fread(signature, 1, 4, zip_file) != 4) {
-            if (feof(zip_file)) break;
-            perror("Error reading signature");
-            fclose(zip_file);
-            return 1;
-        }
-        // printf("Read signature: %02x%02x%02x%02x\n", signature[0], signature[1], signature[2], signature[3]);
-
-        // Check for end of central directory signature
-        if (signature[0] == 0x50 && signature[1] == 0x4b && signature[2] == 0x05 && signature[3] == 0x06) {
-            printf("End of central directory reached\n");
-            break; // End of central directory reached
-        }
-
-        // Check for central directory header signature
-        if (signature[0] == 0x50 && signature[1] == 0x4b && signature[2] == 0x01 && signature[3] == 0x02) {
-            printf("Central directory reached\n");
             break;
         }
 
-        // Check for local file header signature
-        if (!(signature[0] == 0x50 && signature[1] == 0x4b && signature[2] == 0x03 && signature[3] == 0x04)) {
-            fprintf(stderr, "Unexpected signature: %02x%02x%02x%02x\n", signature[0], signature[1], signature[2], signature[3]);
-            fclose(zip_file);
-            return 1;
+        if (signature[0] == 0x50 && signature[1] == 0x4b &&
+            signature[2] == 0x05 && signature[3] == 0x06) {
+            break;
         }
 
-        // Read local file header (26 bytes)
+        if (signature[0] == 0x50 && signature[1] == 0x4b &&
+            signature[2] == 0x01 && signature[3] == 0x02) {
+            break;
+        }
+
+        if (!(signature[0] == 0x50 && signature[1] == 0x4b &&
+              signature[2] == 0x03 && signature[3] == 0x04)) {
+            break;
+        }
+
         unsigned char header[26];
-        if (fread(header, 1, 26, zip_file) != 26) {
-            perror("Error reading local header");
-            fclose(zip_file);
-            return 1;
-        }
+        if (fread(header, 1, 26, zip_file) != 26) break;
 
-        // Extract fields (little-endian)
-        unsigned short version_needed = header[0] | (header[1] << 8);
-        unsigned short gp_flag = header[2] | (header[3] << 8);
-        unsigned short compression_method = header[4] | (header[5] << 8);
-        unsigned short last_mod_time = header[6] | (header[7] << 8);
-        unsigned short last_mod_date = header[8] | (header[9] << 8);
-        unsigned int crc32 = header[10] | (header[11] << 8) | (header[12] << 16) | (header[13] << 24);
         unsigned int compressed_size = header[14] | (header[15] << 8) | (header[16] << 16) | (header[17] << 24);
         unsigned int uncompressed_size = header[18] | (header[19] << 8) | (header[20] << 16) | (header[21] << 24);
         unsigned short filename_length = header[22] | (header[23] << 8);
         unsigned short extra_field_length = header[24] | (header[25] << 8);
 
-        // printf("GP flag: 0x%04x\n", gp_flag);
-        // printf("Extra field length: %d\n", extra_field_length);
-        // printf("Compression method: %d\n", compression_method);
-        // printf("Compressed size: %u\n", compressed_size);
-        // printf("Uncompressed size: %u\n", uncompressed_size);
-        // printf("Filename length: %d\n", filename_length);
+        char *filename = malloc(filename_length + 1);
+        if (!filename) break;
+        fread(filename, 1, filename_length, zip_file);
+        filename[filename_length] = '\0';
 
-        // Read filename
+        fseek(zip_file, extra_field_length, SEEK_CUR);
+
+        if (filename[filename_length - 1] != '/') {
+            printf("  %8u  %12u   %s\n", uncompressed_size, compressed_size, filename);
+            total_compressed += compressed_size;
+            total_uncompressed += uncompressed_size;
+            entry_count++;
+        }
+
+        fseek(zip_file, compressed_size, SEEK_CUR);
+        free(filename);
+    }
+
+    printf("  --------  ------------   ----------------\n");
+    printf("  %8I64u  %12I64u   %d files\n", (unsigned long long)total_uncompressed, (unsigned long long)total_compressed, entry_count);
+
+    fclose(zip_file);
+    return 0;
+}
+
+int test_zip_integrity(const char *zip_path, Options *opts) {
+    FILE *zip_file = fopen(zip_path, "rb");
+    if (!zip_file) {
+        fprintf(stderr, "Error: Cannot open ZIP file '%s'\n", zip_path);
+        return 1;
+    }
+
+    printf("Testing archive: %s\n", zip_path);
+
+    unsigned char signature[4];
+    int entry_count = 0;
+    int passed = 0;
+    int failed = 0;
+
+    while (1) {
+        if (fread(signature, 1, 4, zip_file) != 4) {
+            break;
+        }
+
+        if (signature[0] == 0x50 && signature[1] == 0x4b &&
+            (signature[2] == 0x05 || signature[2] == 0x01)) {
+            break;
+        }
+
+        if (!(signature[0] == 0x50 && signature[1] == 0x4b &&
+              signature[2] == 0x03 && signature[3] == 0x04)) {
+            break;
+        }
+
+        unsigned char header[26];
+        if (fread(header, 1, 26, zip_file) != 26) break;
+
+        unsigned int compressed_size = header[14] | (header[15] << 8) | (header[16] << 16) | (header[17] << 24);
+        unsigned int uncompressed_size = header[18] | (header[19] << 8) | (header[20] << 16) | (header[21] << 24);
+        unsigned int stored_crc = header[10] | (header[11] << 8) | (header[12] << 16) | (header[13] << 24);
+        unsigned short compression_method = header[4] | (header[5] << 8);
+        unsigned short filename_length = header[22] | (header[23] << 8);
+        unsigned short extra_field_length = header[24] | (header[25] << 8);
+
+        char *filename = malloc(filename_length + 1);
+        if (!filename) break;
+        fread(filename, 1, filename_length, zip_file);
+        filename[filename_length] = '\0';
+
+        fseek(zip_file, extra_field_length, SEEK_CUR);
+
+        if (filename[filename_length - 1] == '/' || compressed_size == 0) {
+            free(filename);
+            fseek(zip_file, compressed_size, SEEK_CUR);
+            continue;
+        }
+
+        unsigned char *compressed_data = malloc(compressed_size);
+        if (!compressed_data) {
+            free(filename);
+            break;
+        }
+        fread(compressed_data, 1, compressed_size, zip_file);
+
+        unsigned char *file_data;
+        unsigned int final_size;
+        unsigned int calculated_crc = 0;
+
+        if (compression_method == 0) {
+            file_data = compressed_data;
+            final_size = compressed_size;
+            calculated_crc = calculate_crc32(file_data, final_size);
+        } else if (compression_method == 8) {
+            file_data = malloc(uncompressed_size);
+            if (!file_data) {
+                free(compressed_data);
+                free(filename);
+                continue;
+            }
+
+            z_stream strm;
+            strm.zalloc = Z_NULL;
+            strm.zfree = Z_NULL;
+            strm.opaque = Z_NULL;
+            strm.avail_in = compressed_size;
+            strm.next_in = compressed_data;
+            strm.avail_out = uncompressed_size;
+            strm.next_out = file_data;
+
+            if (inflateInit2(&strm, -15) == Z_OK && inflate(&strm, Z_FINISH) == Z_STREAM_END) {
+                final_size = uncompressed_size;
+                calculated_crc = calculate_crc32(file_data, final_size);
+            } else {
+                final_size = 0;
+            }
+            inflateEnd(&strm);
+            free(compressed_data);
+        } else {
+            final_size = 0;
+            free(compressed_data);
+        }
+
+        if (final_size > 0 && calculated_crc == stored_crc) {
+            if (!opts->quiet) printf("  [OK] %s\n", filename);
+            passed++;
+        } else {
+            fprintf(stderr, "  [FAILED] %s - CRC mismatch or decompression failed\n", filename);
+            failed++;
+        }
+
+        if (compression_method == 8) free(file_data);
+        free(filename);
+        entry_count++;
+    }
+
+    fclose(zip_file);
+
+    printf("\nResult: %d OK, %d failed\n", passed, failed);
+    return failed > 0 ? 1 : 0;
+}
+
+int main(int argc, char *argv[]) {
+    Options opts;
+    const char *zip_path = NULL;
+
+    if (parse_arguments(argc, argv, &opts, &zip_path) != 0) {
+        return 1;
+    }
+
+    if (opts.quiet && opts.verbose) {
+        fprintf(stderr, "Error: Cannot use both -v (verbose) and -q (quiet)\n");
+        return 1;
+    }
+
+    if (!opts.quiet) {
+        printf("Dezipper v%s - Extracting and freeing disk space\n\n", VERSION);
+    }
+
+    if (opts.list_only) {
+        return list_zip_contents(zip_path, &opts);
+    }
+
+    if (opts.verify_crc) {
+        return test_zip_integrity(zip_path, &opts);
+    }
+
+    FILE *zip_file = fopen(zip_path, "r+b");
+    if (!zip_file) {
+        fprintf(stderr, "Error: Cannot open ZIP file '%s'\n", zip_path);
+        return 1;
+    }
+
+    if (!opts.quiet) {
+        printf("Opening: %s\n", zip_path);
+    }
+
+    unsigned char signature[4];
+    int entry_count = 0;
+    long central_dir_offset = 0;
+    EntryInfo entries[MAX_ENTRIES];
+    (void)entries; // Used for tracking when truncation is enabled
+    int extracted_count = 0;
+    unsigned long long total_extracted = 0;
+    unsigned long long total_compressed = 0;
+
+    while (1) {
+        if (fread(signature, 1, 4, zip_file) != 4) {
+            if (feof(zip_file)) break;
+            fprintf(stderr, "Error: Failed to read from ZIP file\n");
+            fclose(zip_file);
+            return 1;
+        }
+
+        if (signature[0] == 0x50 && signature[1] == 0x4b &&
+            signature[2] == 0x05 && signature[3] == 0x06) {
+            if (opts.verbose) printf("End of central directory\n");
+            break;
+        }
+
+        if (signature[0] == 0x50 && signature[1] == 0x4b &&
+            signature[2] == 0x01 && signature[3] == 0x02) {
+            central_dir_offset = ftell(zip_file) - 4;
+            if (opts.verbose) printf("Central directory at offset %ld\n", central_dir_offset);
+            break;
+        }
+
+        if (!(signature[0] == 0x50 && signature[1] == 0x4b &&
+              signature[2] == 0x03 && signature[3] == 0x04)) {
+            fprintf(stderr, "Error: Invalid signature at offset %ld\n", ftell(zip_file) - 4);
+            fclose(zip_file);
+            return 1;
+        }
+
+        unsigned char header[26];
+        if (fread(header, 1, 26, zip_file) != 26) {
+            fprintf(stderr, "Error: Failed to read local file header\n");
+            fclose(zip_file);
+            return 1;
+        }
+
+        unsigned short compression_method = header[4] | (header[5] << 8);
+        unsigned int crc32 = header[10] | (header[11] << 8) | (header[12] << 16) | (header[13] << 24);
+        unsigned int compressed_size = header[14] | (header[15] << 8) | (header[16] << 16) | (header[17] << 24);
+        unsigned int uncompressed_size = header[18] | (header[19] << 8) | (header[20] << 16) | (header[21] << 24);
+        unsigned short filename_length = header[22] | (header[23] << 8);
+        unsigned short extra_field_length = header[24] | (header[25] << 8);
+        unsigned short last_mod_time = header[6] | (header[7] << 8);
+        unsigned short last_mod_date = header[8] | (header[9] << 8);
+
         char *filename = malloc(filename_length + 1);
         if (!filename) {
-            perror("malloc failed");
+            fprintf(stderr, "Error: Memory allocation failed\n");
             fclose(zip_file);
             return 1;
         }
         if (fread(filename, 1, filename_length, zip_file) != filename_length) {
-            perror("Error reading filename");
+            fprintf(stderr, "Error: Failed to read filename\n");
             free(filename);
             fclose(zip_file);
             return 1;
         }
         filename[filename_length] = '\0';
-        // printf("Filename: %s\n", filename);
 
-        // Read extra field
         if (extra_field_length > 0) {
             fseek(zip_file, extra_field_length, SEEK_CUR);
         }
 
-        // Handle data descriptor if GP flag bit 3 is set
-        if (gp_flag & 0x0008) {
-            // Data descriptor present: we need to read it after the compressed data
-            // For simplicity, we'll assume no data descriptor in this implementation
-            fprintf(stderr, "Data descriptor not supported\n");
-            free(filename);
-            fclose(zip_file);
-            return 1;
-        }
-
-        // Only handle stored data (compression method 0) for now
-        if (compression_method != 0) {
-            fprintf(stderr, "Warning: unsupported compression method %d for file %s, skipping\n", compression_method, filename);
-            // Skip the compressed data
-            fseek(zip_file, compressed_size, SEEK_CUR);
-            free(filename);
-            continue;
-        }
-
-        // Skip directories (0-byte files)
         if (compressed_size == 0) {
-            printf("Skipping directory: %s\n", filename);
+            if (opts.verbose) printf("Skipping directory: %s\n", filename);
             free(filename);
             continue;
         }
 
-        // Now we have stored data: the next 'compressed_size' bytes are the file data
-        unsigned char *file_data = malloc(compressed_size);
-        if (!file_data) {
-            perror("malloc failed");
+        unsigned char *compressed_data = malloc(compressed_size);
+        if (!compressed_data) {
+            fprintf(stderr, "Error: Memory allocation failed for compressed data\n");
             free(filename);
             fclose(zip_file);
             return 1;
         }
-        if (fread(file_data, 1, compressed_size, zip_file) != compressed_size) {
-            perror("Error reading file data");
-            free(file_data);
+        if (fread(compressed_data, 1, compressed_size, zip_file) != compressed_size) {
+            fprintf(stderr, "Error: Failed to read compressed data for '%s'\n", filename);
+            free(compressed_data);
             free(filename);
             fclose(zip_file);
             return 1;
         }
 
-        // Create output file path
+        unsigned char *file_data;
+        unsigned int final_size;
+
+        if (compression_method == 0) {
+            file_data = compressed_data;
+            final_size = compressed_size;
+        } else if (compression_method == 8) {
+            file_data = malloc(uncompressed_size);
+            if (!file_data) {
+                fprintf(stderr, "Error: Memory allocation failed for decompressed data\n");
+                free(compressed_data);
+                free(filename);
+                fclose(zip_file);
+                return 1;
+            }
+
+            z_stream strm;
+            strm.zalloc = Z_NULL;
+            strm.zfree = Z_NULL;
+            strm.opaque = Z_NULL;
+            strm.avail_in = compressed_size;
+            strm.next_in = compressed_data;
+            strm.avail_out = uncompressed_size;
+            strm.next_out = file_data;
+
+            int ret = inflateInit2(&strm, -15);
+            if (ret != Z_OK) {
+                fprintf(stderr, "Error: Failed to initialize decompression for '%s'\n", filename);
+                free(compressed_data);
+                free(file_data);
+                free(filename);
+                fclose(zip_file);
+                return 1;
+            }
+
+            ret = inflate(&strm, Z_FINISH);
+            if (ret != Z_STREAM_END) {
+                fprintf(stderr, "Error: Failed to decompress '%s'\n", filename);
+                inflateEnd(&strm);
+                free(compressed_data);
+                free(file_data);
+                free(filename);
+                fclose(zip_file);
+                return 1;
+            }
+
+            inflateEnd(&strm);
+            free(compressed_data);
+            final_size = uncompressed_size;
+
+            if (opts.verbose) {
+                printf("Decompressed %s: %u -> %u bytes\n", filename, compressed_size, uncompressed_size);
+            }
+        } else {
+            fprintf(stderr, "Warning: Unsupported compression method %d for '%s', skipping\n",
+                    compression_method, filename);
+            free(compressed_data);
+            free(filename);
+            fseek(zip_file, compressed_size, SEEK_CUR);
+            continue;
+        }
+
         char output_path[MAX_PATH];
-        strcpy(output_path, filename);
-        // Convert forward slashes to backslashes for Windows
-        for (char *p = output_path; *p; p++) {
-            if (*p == '/') *p = '\\';
+        if (opts.output_dir) {
+            snprintf(output_path, MAX_PATH, "%s\\%s", opts.output_dir, filename);
+        } else {
+            strncpy(output_path, filename, MAX_PATH - 1);
+            output_path[MAX_PATH - 1] = '\0';
         }
+        normalize_path(output_path);
 
-        // Create directories if needed
         char *last_slash = strrchr(output_path, '\\');
         if (last_slash) {
             *last_slash = '\0';
-            printf("Creating directory: %s\n", output_path);
             if (create_directory(output_path) != 0) {
-                fprintf(stderr, "Failed to create directory: %s\n", output_path);
-                *last_slash = '\\';
-                free(file_data);
+                fprintf(stderr, "Error: Failed to create directory '%s'\n", output_path);
+                if (compression_method != 0) free(file_data);
                 free(filename);
                 fclose(zip_file);
                 return 1;
@@ -186,58 +646,100 @@ int main(int argc, char *argv[]) {
             *last_slash = '\\';
         }
 
-        printf("Writing to: %s\n", output_path);
-        // Write output file
-        FILE *out_file = fopen(output_path, "wb");
-        if (!out_file) {
-            perror("Error creating output file");
-            free(file_data);
+        if (!opts.force_overwrite && file_exists(output_path)) {
+            fprintf(stderr, "Error: File already exists '%s' (use -f to overwrite)\n", output_path);
+            if (compression_method != 0) free(file_data);
             free(filename);
             fclose(zip_file);
             return 1;
         }
-        if (fwrite(file_data, 1, compressed_size, out_file) != compressed_size) {
-            perror("Error writing output file");
+
+        FILE *out_file = fopen(output_path, "wb");
+        if (!out_file) {
+            fprintf(stderr, "Error: Failed to create output file '%s'\n", output_path);
+            if (compression_method != 0) free(file_data);
+            free(filename);
+            fclose(zip_file);
+            return 1;
+        }
+        if (fwrite(file_data, 1, final_size, out_file) != final_size) {
+            fprintf(stderr, "Error: Failed to write to '%s'\n", output_path);
             fclose(out_file);
-            free(file_data);
+            if (compression_method != 0) free(file_data);
             free(filename);
             fclose(zip_file);
             return 1;
         }
         fclose(out_file);
-        printf("Extracted %s to %s\n", filename, output_path);
 
-        // Free file data
-        free(file_data);
+        if (opts.preserve_time) {
+            if (set_file_times(output_path, last_mod_time, last_mod_date) == 0) {
+                if (opts.verbose) printf("  Preserved timestamp for %s\n", filename);
+            }
+        }
+
+        if (opts.verify_crc) {
+            unsigned int calculated_crc = calculate_crc32(file_data, final_size);
+            if (calculated_crc != crc32) {
+                fprintf(stderr, "Warning: CRC mismatch for '%s'\n", filename);
+            }
+        }
+
+        if (!opts.quiet) {
+            print_progress(filename, final_size, uncompressed_size, entry_count, 1);
+            printf("\n");
+        }
+        printf("Extracted: %s (%u bytes)\n", filename, final_size);
+
+        if (compression_method != 0) free(file_data);
         free(filename);
 
-        // Go back to start of compressed data and overwrite with zeros
         long data_start_pos = ftell(zip_file) - compressed_size;
-        printf("Zeroing data from offset %ld, size %u\n", data_start_pos, compressed_size);
-        fseek(zip_file, data_start_pos, SEEK_SET);
-        unsigned char *zero_buffer = calloc(1, compressed_size);
-        if (!zero_buffer) {
-            perror("calloc failed");
-            fclose(zip_file);
-            return 1;
-        }
-        if (fwrite(zero_buffer, 1, compressed_size, zip_file) != compressed_size) {
-            perror("Error zeroing compressed data");
-            free(zero_buffer);
-            fclose(zip_file);
-            return 1;
-        }
-        fflush(zip_file);
-        free(zero_buffer);
-        
-        // Seek to end of this entry (start of next entry)
-        fseek(zip_file, data_start_pos + compressed_size, SEEK_SET);
-        printf("After zeroing, position: %ld\n", ftell(zip_file));
 
+        if (extracted_count < MAX_ENTRIES) {
+            entries[extracted_count].data_offset = data_start_pos;
+            entries[extracted_count].compressed_size = compressed_size;
+            entries[extracted_count].uncompressed_size = uncompressed_size;
+            entries[extracted_count].crc32 = crc32;
+            entries[extracted_count].is_extracted = 1;
+            entries[extracted_count].last_mod_time = last_mod_time;
+            entries[extracted_count].last_mod_date = last_mod_date;
+            extracted_count++;
+        }
+
+        if (!opts.keep_zip) {
+            fseek(zip_file, data_start_pos, SEEK_SET);
+            unsigned char *zero_buffer = calloc(1, compressed_size);
+            if (zero_buffer) {
+                fwrite(zero_buffer, 1, compressed_size, zip_file);
+                fflush(zip_file);
+                free(zero_buffer);
+            }
+            fseek(zip_file, data_start_pos + compressed_size, SEEK_SET);
+        }
+
+        total_extracted += final_size;
+        total_compressed += compressed_size;
         entry_count++;
     }
 
+    if (!opts.keep_zip && central_dir_offset > 0 && extracted_count > 0) {
+        fseek(zip_file, 0, SEEK_END);
+        long file_size = ftell(zip_file);
+        long new_size = central_dir_offset;
+
+        HANDLE hFile = (HANDLE)_get_osfhandle(fileno(zip_file));
+        if (SetFilePointer(hFile, new_size, NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER) {
+            if (SetEndOfFile(hFile)) {
+                unsigned long long freed = file_size - new_size;
+                printf("ZIP truncated: %ld -> %ld bytes (freed %I64u bytes)\n",
+                       file_size, new_size, freed);
+            }
+        }
+    }
+
     fclose(zip_file);
-    printf("Extraction complete. Compressed data zeroed out.\n");
+
+    printf("\nExtraction complete: %d files, %I64u bytes extracted\n", entry_count, total_extracted);
     return 0;
 }
