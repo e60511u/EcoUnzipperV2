@@ -1,0 +1,19 @@
+Je veux créer un programme capable de décompresser un fichier ZIP (et plus tard d’autres formats comme RAR) tout en optimisant l’espace disque pendant l’extraction.
+
+Le principe :
+
+Le logiciel commence à décompresser le fichier.
+
+Dès qu’une partie du contenu compressé a été extraite avec succès,
+il supprime immédiatement la portion correspondante du fichier d’origine.
+
+L’objectif est d’éviter d’avoir en même temps :
+
+le fichier compressé complet
+
+et sa version décompressée complète
+qui occupent ensemble beaucoup d’espace.
+
+En résumé :
+
+Un extracteur qui libère l’espace au fur et à mesure qu’il travaille, au lieu d’attendre la fin de l’extraction pour supprimer le fichier compressé.
