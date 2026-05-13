@@ -52,6 +52,7 @@ typedef struct {
     int verbose;
     int quiet;
     int show_progress;
+    int safe_mode;
 } Options;
 
 int create_directory(const char *path);

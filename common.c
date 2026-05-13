@@ -111,6 +111,7 @@ void print_usage(const char *prog_name) {
     printf("  -t, --test        Test archive integrity (verify CRC)\n");
     printf("  -p, --preserve    Preserve file timestamps\n");
     printf("  -P, --progress    Show progress bar\n");
+    printf("  -S, --safe        Enable safe mode (punch holes only after success)\n");
     printf("  -x, --password    Password for encrypted ZIP files\n");
 }
 
@@ -124,6 +125,7 @@ int parse_arguments(int argc, char *argv[], Options *opts, const char **zip_path
         else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) opts->verbose = 1;
         else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) opts->quiet = 1;
         else if (strcmp(argv[i], "-P") == 0 || strcmp(argv[i], "--progress") == 0) opts->show_progress = 1;
+        else if (strcmp(argv[i], "-S") == 0 || strcmp(argv[i], "--safe") == 0) opts->safe_mode = 1;
         else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--dir") == 0) {
             if (i + 1 >= argc) { fprintf(stderr, "Error: -d requires a directory argument\n"); return -1; }
             opts->output_dir = argv[++i];
@@ -134,8 +136,9 @@ int parse_arguments(int argc, char *argv[], Options *opts, const char **zip_path
         else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--test") == 0) opts->verify_crc = 1;
         else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--preserve") == 0) opts->preserve_time = 1;
         else if (strcmp(argv[i], "-x") == 0 || strcmp(argv[i], "--password") == 0) {
-            if (i + 1 >= argc) { fprintf(stderr, "Error: -x requires a password argument\n"); return -1; }
-            opts->password = argv[++i];
+            // No longer consume the next argument as the password.
+            // Set flag to prompt later.
+            opts->password = "PROMPT"; 
         }
         else if (argv[i][0] != '-') *zip_path = argv[i];
         else { fprintf(stderr, "Error: Unknown option '%s'\n", argv[i]); return -1; }

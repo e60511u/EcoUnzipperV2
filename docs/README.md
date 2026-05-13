@@ -7,11 +7,12 @@ Dezipper is a high-performance Windows utility that extracts ZIP files while act
 ## Features
 
 ### Core Functionality
-- **Robust ZIP Extraction**: Uses standard Central Directory parsing for 100% reliability.
+- **Robust ZIP Extraction**: Reliable for standard single-disk ZIP archives using Deflate or Stored compression.
 - **ZIP64 Support**: Handles "huge" archives and files exceeding 4GB.
 - **Real-time Space Recovery**: Utilizes **NTFS Sparse Files** to zero out and reclaim disk blocks *while* extracting.
-- **Pause & Resume**: Supports pausing extraction and restarting later; already-extracted files are automatically skipped.
+- **Pause & Resume**: Supports pausing extraction and restarting later; uses a `.dezipper_progress` manifest file to automatically skip already-extracted files.
 - **Auto-Cleanup**: Automatically deletes the ZIP archive once extraction and space reclamation are complete (unless `-k` is used).
+- **Secure Password Handling**: Password is provided via interactive prompt instead of CLI arguments, protecting sensitive data.
 - **Multi-file & Directory Support**: Recreates complex folder structures accurately.
 - **CRC-32 Validation**: Verifies file integrity during extraction.
 
@@ -68,13 +69,11 @@ gcc -Wall -Wextra -o bin/dezipper.exe common.c extract.c gui.c main.c -lz -lgdi3
 - **v2.3.0**:
   - Added CLI text-based progress bar (`-P`).
   - Added GUI visual progress bar.
-  - Implemented Pause/Resume functionality.
+  - Implemented Pause/Resume functionality with manifest tracking.
   - Added automatic ZIP file deletion after extraction.
-- **v2.2.0**: 
-  - Implemented **NTFS Sparse File** support for real-time space reclamation.
-  - Added full **ZIP64** support (archives > 4GB).
-  - Switched to 64-bit file offsets (`fseeko64`/`ftello64`).
-  - Improved GUI layout and fixed progress text clipping.
+  - Added secure interactive password prompting.
+  - Added `LICENSE` (MIT).
+  - Improved reliability claims and filesystem awareness.
 - **v2.1.0**: 
   - Switched to Central Directory parsing for robust extraction.
   - Fixed "missing files" bug in linear scanning.
@@ -86,4 +85,4 @@ gcc -Wall -Wextra -o bin/dezipper.exe common.c extract.c gui.c main.c -lz -lgdi3
 
 ## License
 
-This project is provided as-is for educational and personal use.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more details.
