@@ -5,6 +5,8 @@
 #include <zlib.h>
 #include <io.h>
 #include <commdlg.h>
+#include <windows.h>
+#include <winioctl.h>
 
 extern int create_directory(const char *path);
 extern void normalize_path(char *path);
@@ -13,165 +15,194 @@ extern void get_zip_basename(const char *zip_path, char *output, size_t output_s
 extern void TrimSpaces(char *str);
 extern int set_file_times(const char *path, unsigned int dostime, unsigned int dosdate);
 
+extern int extract_entry(FILE *zip_file, char *filename, unsigned int filename_length,
+                  unsigned short compression_method, unsigned long long compressed_size,
+                  unsigned long long uncompressed_size, unsigned short last_mod_time,
+                  unsigned short last_mod_date, const char *output_dir, int preserve_time);
+
+#ifdef _WIN32
+#define fseek64 fseeko64
+#define ftell64 ftello64
+#else
+#define fseek64 fseeko
+#define ftell64 ftello
+#endif
+
+void gui_enable_sparse(HANDLE hFile) {
+    DWORD dwTemp;
+    DeviceIoControl(hFile, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &dwTemp, NULL);
+}
+
+void gui_free_disk_space(HANDLE hFile, unsigned long long offset, unsigned long long size) {
+    if (size == 0) return;
+    FILE_ZERO_DATA_INFORMATION fzdi;
+    fzdi.FileOffset.QuadPart = (LONGLONG)offset;
+    fzdi.BeyondFinalZero.QuadPart = (LONGLONG)(offset + size);
+    DWORD dwTemp;
+    DeviceIoControl(hFile, FSCTL_SET_ZERO_DATA, &fzdi, sizeof(fzdi), NULL, 0, &dwTemp, NULL);
+}
+
 DWORD WINAPI ExtractionThreadProc(LPVOID lpParam) {
     ExtractionParams *params = (ExtractionParams *)lpParam;
     
-    FILE *zip_file = fopen(params->zip_path, "rb");
+    // Open in r+b to allow sparse operations
+    FILE *zip_file = fopen(params->zip_path, "r+b");
     if (!zip_file) {
         PostMessage(params->hwnd, WM_EXTRACTION_ERROR, 0, (LPARAM)strdup("Cannot open ZIP file"));
         free(params);
         return 1;
     }
 
+    HANDLE hZip = (HANDLE)_get_osfhandle(fileno(zip_file));
+    if (!params->keep_zip) {
+        gui_enable_sparse(hZip);
+    }
+
     char output_dir[MAX_PATH_LEN];
     get_zip_basename(params->zip_path, output_dir, MAX_PATH_LEN);
     create_directory(output_dir);
 
-    unsigned char signature[4];
-    int entry_count = 0;
-    unsigned long long total_extracted = 0;
+    // Find EOCD
+    fseek64(zip_file, 0, SEEK_END);
+    unsigned long long file_size = ftell64(zip_file);
+    unsigned long long eocd_pos = 0;
+    unsigned char buf[4];
+    int found = 0;
 
-    while (fread(signature, 1, 4, zip_file) == 4) {
-        if (!(signature[0] == 0x50 && signature[1] == 0x4b && signature[2] == 0x03 && signature[3] == 0x04)) {
+    for (int i = 0; i <= 65535; i++) {
+        unsigned long long pos = (file_size > 22 + (unsigned long long)i) ? file_size - 22 - i : 0;
+        fseek64(zip_file, (long long)pos, SEEK_SET);
+        if (fread(buf, 1, 4, zip_file) == 4 && buf[0] == 'P' && buf[1] == 'K' && buf[2] == 0x05 && buf[3] == 0x06) {
+            eocd_pos = pos;
+            found = 1;
             break;
         }
+        if (pos == 0) break;
+    }
 
-        unsigned char header[26];
-        if (fread(header, 1, 26, zip_file) != 26) break;
+    if (!found) {
+        PostMessage(params->hwnd, WM_EXTRACTION_ERROR, 0, (LPARAM)strdup("Could not find ZIP Central Directory"));
+        fclose(zip_file);
+        free(params);
+        return 1;
+    }
 
-        unsigned short compression_method = header[4] | (header[5] << 8);
-        unsigned int compressed_size = header[14] | (header[15] << 8) | (header[16] << 16) | (header[17] << 24);
-        unsigned int uncompressed_size = header[18] | (header[19] << 8) | (header[20] << 16) | (header[21] << 24);
-        unsigned short filename_length = header[22] | (header[23] << 8);
-        unsigned short extra_field_length = header[24] | (header[25] << 8);
-        unsigned short last_mod_time = header[6] | (header[7] << 8);
-        unsigned short last_mod_date = header[8] | (header[9] << 8);
+    unsigned char eocd[22];
+    fseek64(zip_file, (long long)eocd_pos, SEEK_SET);
+    fread(eocd, 1, 22, zip_file);
 
-        char *filename = (char *)malloc(filename_length + 1);
-        fread(filename, 1, filename_length, zip_file);
-        filename[filename_length] = '\0';
-        fseek(zip_file, extra_field_length, SEEK_CUR);
+    unsigned long long total_entries = READ_LE16(eocd + 10);
+    unsigned long long cd_offset = READ_LE32(eocd + 16);
 
-        int is_directory = (filename_length > 0 && 
-                          (filename[filename_length - 1] == '/' || 
-                           filename[filename_length - 1] == '\\'));
-
-        if (is_directory) {
-            char dir_path[MAX_PATH_LEN];
-            snprintf(dir_path, MAX_PATH_LEN, "%s\\%s", output_dir, filename);
-            for (char *p = dir_path; *p; p++) if (*p == '/') *p = '\\';
-            size_t dir_len = strlen(dir_path);
-            if (dir_len > 0 && (dir_path[dir_len-1] == '\\' || dir_path[dir_len-1] == '/')) {
-                dir_path[dir_len-1] = '\0';
+    // Check for ZIP64 EOCD Locator
+    if (eocd_pos >= 20) {
+        fseek64(zip_file, (long long)(eocd_pos - 20), SEEK_SET);
+        unsigned char locator[20];
+        if (fread(locator, 1, 20, zip_file) == 20 && locator[0] == 'P' && locator[1] == 'K' && locator[2] == 0x06 && locator[3] == 0x07) {
+            unsigned long long zip64_eocd_pos = READ_LE64(locator + 8);
+            fseek64(zip_file, (long long)zip64_eocd_pos, SEEK_SET);
+            unsigned char eocd64[56];
+            if (fread(eocd64, 1, 56, zip_file) == 56 && eocd64[0] == 'P' && eocd64[1] == 'K' && eocd64[2] == 0x06 && eocd64[3] == 0x06) {
+                total_entries = READ_LE64(eocd64 + 24);
+                cd_offset = READ_LE64(eocd64 + 48);
             }
-            create_directory(dir_path);
-            free(filename);
-            entry_count++;
-            continue;
         }
+    }
 
-        if (compressed_size == 0) {
-            char output_path[MAX_PATH_LEN];
-            snprintf(output_path, MAX_PATH_LEN, "%s\\%s", output_dir, filename);
-            for (char *p = output_path; *p; p++) if (*p == '/') *p = '\\';
-            char *last_slash = strrchr(output_path, '\\');
-            if (last_slash) { *last_slash = '\0'; create_directory(output_path); *last_slash = '\\'; }
-            FILE *out_file = fopen(output_path, "wb");
-            if (out_file) {
-                fclose(out_file);
-                if (params->preserve_time) set_file_times(output_path, last_mod_time, last_mod_date);
+    int entry_count = 0;
+    unsigned long long total_extracted = 0;
+    fseek64(zip_file, (long long)cd_offset, SEEK_SET);
+
+    for (unsigned long long i = 0; i < total_entries; i++) {
+        unsigned char cd[46];
+        if (fread(cd, 1, 46, zip_file) != 46) break;
+        if (cd[0] != 'P' || cd[1] != 'K' || cd[2] != 0x01 || cd[3] != 0x02) break;
+
+        unsigned short method = READ_LE16(cd + 10);
+        unsigned short mod_time = READ_LE16(cd + 12);
+        unsigned short mod_date = READ_LE16(cd + 14);
+        unsigned long long comp_size = READ_LE32(cd + 20);
+        unsigned long long uncomp_size = READ_LE32(cd + 24);
+        unsigned short name_len = READ_LE16(cd + 28);
+        unsigned short extra_len = READ_LE16(cd + 30);
+        unsigned short comment_len = READ_LE16(cd + 32);
+        unsigned long long local_offset = READ_LE32(cd + 42);
+
+        char *filename = (char *)malloc(name_len + 1);
+        fread(filename, 1, name_len, zip_file);
+        filename[name_len] = '\0';
+
+        // Check for ZIP64 extra fields
+        if (comp_size == 0xFFFFFFFF || uncomp_size == 0xFFFFFFFF || local_offset == 0xFFFFFFFF) {
+            unsigned char *extra = (unsigned char *)malloc(extra_len);
+            fread(extra, 1, extra_len, zip_file);
+            for (int e = 0; e < extra_len - 4; ) {
+                unsigned short tag = READ_LE16(extra + e);
+                unsigned short tsize = READ_LE16(extra + e + 2);
+                if (tag == 0x0001) {
+                    int p = e + 4;
+                    if (uncomp_size == 0xFFFFFFFF && p + 8 <= e + 4 + tsize) {
+                        uncomp_size = READ_LE64(extra + p); p += 8;
+                    }
+                    if (comp_size == 0xFFFFFFFF && p + 8 <= e + 4 + tsize) {
+                        comp_size = READ_LE64(extra + p); p += 8;
+                    }
+                    if (local_offset == 0xFFFFFFFF && p + 8 <= e + 4 + tsize) {
+                        local_offset = READ_LE64(extra + p);
+                    }
+                }
+                e += 4 + tsize;
             }
-            free(filename);
-            entry_count++;
-            continue;
-        }
-
-        unsigned char *compressed_data = (unsigned char *)malloc(compressed_size);
-        fread(compressed_data, 1, compressed_size, zip_file);
-
-        unsigned char *file_data = NULL;
-        unsigned int final_size = 0;
-
-        if (compression_method == 0) {
-            file_data = compressed_data;
-            final_size = compressed_size;
-        } else if (compression_method == 8) {
-            file_data = (unsigned char *)malloc(uncompressed_size);
-            if (file_data) {
-                z_stream strm = {0};
-                strm.zalloc = Z_NULL;
-                strm.zfree = Z_NULL;
-                strm.opaque = Z_NULL;
-                strm.avail_in = compressed_size;
-                strm.next_in = compressed_data;
-                strm.avail_out = uncompressed_size;
-                strm.next_out = file_data;
-                inflateInit2(&strm, -15);
-                inflate(&strm, Z_FINISH);
-                inflateEnd(&strm);
-                free(compressed_data);
-                final_size = uncompressed_size;
-            } else {
-                free(compressed_data);
-                free(filename);
-                continue;
-            }
+            free(extra);
+            fseek64(zip_file, (long long)comment_len, SEEK_CUR);
         } else {
-            free(compressed_data);
-            free(filename);
-            continue;
+            fseek64(zip_file, (long long)(extra_len + comment_len), SEEK_CUR);
         }
 
-        char output_path[MAX_PATH_LEN];
-        snprintf(output_path, MAX_PATH_LEN, "%s\\%s", output_dir, filename);
-        for (char *p = output_path; *p; p++) if (*p == '/') *p = '\\';
+        unsigned long long next_cd = ftell64(zip_file);
 
-        char *last_slash = strrchr(output_path, '\\');
-        if (last_slash) { *last_slash = '\0'; create_directory(output_path); *last_slash = '\\'; }
-
-        FILE *out_file = fopen(output_path, "wb");
-        if (out_file) {
-            fwrite(file_data, 1, final_size, out_file);
-            fclose(out_file);
-            if (params->preserve_time) set_file_times(output_path, last_mod_time, last_mod_date);
-        }
-
-        if (compression_method != 0) free(file_data);
-        free(filename);
-
-        total_extracted += final_size;
-        entry_count++;
+        // Jump to Local Header
+        fseek64(zip_file, (long long)local_offset, SEEK_SET);
+        unsigned char lfh[30];
+        fread(lfh, 1, 30, zip_file);
+        unsigned short lfh_name_len = READ_LE16(lfh + 26);
+        unsigned short lfh_extra_len = READ_LE16(lfh + 28);
+        unsigned long long data_offset = local_offset + 30 + lfh_name_len + lfh_extra_len;
+        fseek64(zip_file, (long long)(lfh_name_len + lfh_extra_len), SEEK_CUR);
 
         char *progress_msg = (char *)malloc(256);
         if (progress_msg) {
             snprintf(progress_msg, 256, "Extracting: %s", filename);
             PostMessage(params->hwnd, WM_EXTRACTION_PROGRESS, (WPARAM)entry_count, (LPARAM)progress_msg);
         }
-    }
 
-    fclose(zip_file);
+        char output_path[MAX_PATH_LEN];
+        snprintf(output_path, MAX_PATH_LEN, "%s\\%s", output_dir, filename);
+        normalize_path(output_path);
 
-    if (!params->keep_zip) {
-        zip_file = fopen(params->zip_path, "rb");
-        if (zip_file) {
-            fseek(zip_file, -22, SEEK_END);
-            unsigned char eocd[22];
-            if (fread(eocd, 1, 22, zip_file) == 22 && eocd[0] == 0x50 && eocd[1] == 0x4b && 
-                eocd[2] == 0x05 && eocd[3] == 0x06) {
-                long cd_offset = eocd[16] | (eocd[17] << 8) | (eocd[18] << 16) | (eocd[19] << 24);
-                fclose(zip_file);
-                zip_file = fopen(params->zip_path, "r+b");
-                if (zip_file) {
-                    HANDLE hFile = (HANDLE)_get_osfhandle(fileno(zip_file));
-                    SetFilePointer(hFile, cd_offset, NULL, FILE_BEGIN);
-                    SetEndOfFile(hFile);
-                    fclose(zip_file);
+        if (!params->force_overwrite && file_exists(output_path)) {
+            // skip
+        } else {
+            if (extract_entry(zip_file, filename, name_len, method, comp_size, uncomp_size, mod_time, mod_date, output_dir, params->preserve_time)) {
+                total_extracted += uncomp_size;
+                if (!params->keep_zip && comp_size > 0) {
+                    gui_free_disk_space(hZip, data_offset, comp_size);
                 }
-            } else {
-                fclose(zip_file);
             }
         }
+
+        free(filename);
+        entry_count++;
+        fseek64(zip_file, (long long)next_cd, SEEK_SET);
     }
+
+    if (!params->keep_zip) {
+        LARGE_INTEGER li;
+        li.QuadPart = (LONGLONG)cd_offset;
+        SetFilePointerEx(hZip, li, NULL, FILE_BEGIN);
+        SetEndOfFile(hZip);
+    }
+    fclose(zip_file);
 
     char *msg = (char *)malloc(512);
     if (msg) {
@@ -207,11 +238,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             hFontNormal = CreateFontIndirect(&lf);
 
             HWND hTitleLabel = CreateWindow("STATIC", "Dezipper", WS_VISIBLE | WS_CHILD, 
-                25, 15, 350, 35, hwnd, (HMENU)100, NULL, NULL);
+                25, 15, 450, 35, hwnd, (HMENU)100, NULL, NULL);
             SendMessage(hTitleLabel, WM_SETFONT, (WPARAM)hFontTitle, TRUE);
             
             HWND hSubtitleLabel = CreateWindow("STATIC", "Extract ZIP files & free disk space", WS_VISIBLE | WS_CHILD, 
-                25, 48, 350, 20, hwnd, (HMENU)101, NULL, NULL);
+                25, 48, 450, 20, hwnd, (HMENU)101, NULL, NULL);
             SendMessage(hSubtitleLabel, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
 
             HWND hZipLabel = CreateWindow("STATIC", "ZIP File:", WS_VISIBLE | WS_CHILD, 
@@ -219,12 +250,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessage(hZipLabel, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
 
             HWND hEditPath = CreateWindow("EDIT", "", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
-                25, 108, 260, 26, hwnd, (HMENU)1, NULL, NULL);
+                25, 108, 380, 26, hwnd, (HMENU)1, NULL, NULL);
             SendMessage(hEditPath, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
             SendMessage(hEditPath, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(5, 5));
 
             HWND hBrowse = CreateWindow("BUTTON", "Browse...", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-                293, 108, 82, 26, hwnd, (HMENU)2, NULL, NULL);
+                415, 108, 82, 26, hwnd, (HMENU)2, NULL, NULL);
             SendMessage(hBrowse, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
 
             HWND hPassLabel = CreateWindow("STATIC", "Password (optional):", WS_VISIBLE | WS_CHILD, 
@@ -232,23 +263,23 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessage(hPassLabel, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
 
             HWND hPassEdit = CreateWindow("EDIT", "", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD,
-                25, 170, 350, 26, hwnd, (HMENU)10, NULL, NULL);
+                25, 170, 470, 26, hwnd, (HMENU)10, NULL, NULL);
             SendMessage(hPassEdit, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
             SendMessage(hPassEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(5, 5));
 
             HWND hCheckKeep = CreateWindow("BUTTON", "Keep original ZIP file", 
-                WS_VISIBLE | WS_CHILD | BS_CHECKBOX | WS_TABSTOP,
-                35, 215, 200, 22, hwnd, (HMENU)3, NULL, NULL);
+                WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP,
+                35, 215, 300, 22, hwnd, (HMENU)3, NULL, NULL);
             SendMessage(hCheckKeep, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
 
             HWND hCheckPreserve = CreateWindow("BUTTON", "Preserve file timestamps", 
-                WS_VISIBLE | WS_CHILD | BS_CHECKBOX | WS_TABSTOP,
-                35, 240, 200, 22, hwnd, (HMENU)4, NULL, NULL);
+                WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP,
+                35, 240, 300, 22, hwnd, (HMENU)4, NULL, NULL);
             SendMessage(hCheckPreserve, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
 
             HWND hCheckForce = CreateWindow("BUTTON", "Force overwrite existing files", 
-                WS_VISIBLE | WS_CHILD | BS_CHECKBOX | WS_TABSTOP,
-                35, 265, 220, 22, hwnd, (HMENU)5, NULL, NULL);
+                WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX | WS_TABSTOP,
+                35, 265, 300, 22, hwnd, (HMENU)5, NULL, NULL);
             SendMessage(hCheckForce, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
 
             HWND hExtract = CreateWindow("BUTTON", "Extract ZIP", 
@@ -261,12 +292,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 195, 305, 80, 40, hwnd, (HMENU)7, NULL, NULL);
             SendMessage(hQuit, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
 
-            HWND hStatus = CreateWindow("STATIC", "", WS_VISIBLE | WS_CHILD | SS_LEFT,
-                25, 360, 350, 20, hwnd, (HMENU)8, NULL, NULL);
+            HWND hStatus = CreateWindow("STATIC", "", WS_VISIBLE | WS_CHILD | SS_LEFTNOWORDWRAP,
+                25, 360, 470, 20, hwnd, (HMENU)8, NULL, NULL);
             SendMessage(hStatus, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
 
-            HWND hProgress = CreateWindow("STATIC", "", WS_VISIBLE | WS_CHILD | SS_LEFT,
-                25, 385, 350, 18, hwnd, (HMENU)9, NULL, NULL);
+            HWND hProgress = CreateWindow("STATIC", "", WS_VISIBLE | WS_CHILD | SS_LEFTNOWORDWRAP,
+                25, 385, 470, 18, hwnd, (HMENU)9, NULL, NULL);
             SendMessage(hProgress, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
 
             controls = (GUIControls *)malloc(sizeof(GUIControls));
@@ -390,7 +421,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 int force_overwrite = SendMessage(controls->hCheckForce, BM_GETCHECK, 0, 0) == BST_CHECKED;
 
                 char password[MAX_PATH] = {0};
-                GetWindowText(controls->hEditPassword, password, MAX_PATH);
+                GetWindowText(controls->hPassEdit, password, MAX_PATH);
                 TrimSpaces(password);
 
                 EnableWindow(controls->hExtractButton, FALSE);
@@ -404,6 +435,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 params->zip_path[MAX_PATH - 1] = '\0';
                 params->keep_zip = keep_zip;
                 params->preserve_time = preserve_time;
+                params->force_overwrite = force_overwrite;
                 params->hwnd = hwnd;
                 strncpy(params->password, password, MAX_PATH - 1);
                 params->password[MAX_PATH - 1] = '\0';
@@ -455,7 +487,7 @@ void ShowGUI(void) {
 
     HWND hwnd = CreateWindowEx(0, "DezipperWindow", "Dezipper v1.0.0",
         WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT, 420, 460,
+        CW_USEDEFAULT, CW_USEDEFAULT, 550, 480,
         NULL, NULL, hInstance, NULL);
 
     if (!hwnd) {

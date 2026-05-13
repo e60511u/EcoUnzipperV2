@@ -14,7 +14,6 @@ typedef struct {
     HWND hExtractButton;
     HWND hBrowseButton;
     HWND hQuitButton;
-    HWND hEditPassword;
     HWND hCheckKeep;
     HWND hCheckPreserve;
     HWND hCheckForce;
@@ -27,6 +26,7 @@ typedef struct {
     char zip_path[MAX_PATH_LEN];
     int keep_zip;
     int preserve_time;
+    int force_overwrite;
     char password[MAX_PATH_LEN];
     HWND hwnd;
 } ExtractionParams;
