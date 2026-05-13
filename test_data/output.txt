@@ -1,0 +1,6 @@
+Dezipper v1.0.0 - Extracting and freeing disk space
+
+Opening: fresh_test.zip
+Extracted: ?H?N (14 bytes)
+
+Extraction complete: 1 files, 14 bytes extracted

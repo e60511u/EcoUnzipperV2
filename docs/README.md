@@ -1,6 +1,6 @@
 # Dezipper - ZIP Extractor & Disk Space Saver
 
-**Version**: 1.0.0
+**Version**: 2.0.0
 
 Dezipper is a Windows utility that extracts ZIP files while freeing disk space by truncating the original ZIP file after extraction (removing the compressed data to save space).
 
@@ -11,6 +11,7 @@ Dezipper is a Windows utility that extracts ZIP files while freeing disk space b
 - **Auto-truncation**: Automatically removes compressed data from the original ZIP after extraction
 - **Multi-file Support**: Handles ZIP files with multiple entries
 - **Directory Handling**: Creates proper directory structures during extraction
+- **CRC Validation**: Verifies file integrity after extraction
 
 ### Compression Support
 - Method 0 (Stored/No compression)
@@ -31,17 +32,19 @@ Dezipper is a Windows utility that extracts ZIP files while freeing disk space b
 | `-x, --password` | Password for encrypted ZIPs |
 
 ### GUI Features
-- Modern dark-themed interface
-- File browser dialog
+- Modern dark-themed interface with custom colors (dark blue background, white text)
+- File browser dialog with native Windows dialog
 - Password field (masked input)
-- Options checkboxes
-- Progress animation during extraction
+- Options checkboxes (Keep ZIP, Preserve timestamps, Force overwrite)
+- Progress messages during extraction
+- Threaded extraction (UI stays responsive)
 - Auto-launch when double-clicked
 
 ### Smart Behaviors
 - **Default Output**: Creates a new folder named after the ZIP file
 - **Mode Detection**: Automatically detects CLI vs GUI mode
 - **Directory Creation**: Automatically creates output directories
+- **Error Handling**: Comprehensive error messages for corrupt files
 
 ## Usage Examples
 
@@ -57,16 +60,16 @@ dezipper.exe -d . myarchive.zip
  dezipper.exe -d output myarchive.zip
 
 # Keep original ZIP (no truncation)
-dezipper.exe -k myarchive.zip
+ dezipper.exe -k myarchive.zip
 
 # List contents only
-dezipper.exe -l myarchive.zip
+ dezipper.exe -l myarchive.zip
 
 # Test archive integrity
-dezipper.exe -t myarchive.zip
+ dezipper.exe -t myarchive.zip
 
 # With password for encrypted ZIPs
-dezipper.exe -x mypassword encrypted.zip
+ dezipper.exe -x mypassword encrypted.zip
 ```
 
 ### GUI Mode (double-click the executable)
@@ -94,30 +97,57 @@ dezipper.exe -x mypassword encrypted.zip
 - Windows SDK (for Win32 API)
 
 ### Compilation
+
+#### Modular Build (recommended)
 ```bash
-gcc -Wall -Wextra -o dezipper.exe dezipper.c -lz -lgdi32 -lcomdlg32
+gcc -Wall -Wextra -o bin/dezipper.exe common.c extract.c gui.c main.c -lz -lgdi32 -luser32 -lcomdlg32 -mwindows
+```
+
+#### Or use Makefile
+```bash
+make
 ```
 
 ## File Structure
 
 ```
 Dezipper/
-├── dezipper.c          # Main source code
-├── dezipper.exe         # Compiled executable
-├── README.md            # This file
+├── common.c              # Common utilities (path handling, string utils)
+├── common.h              # Common header with shared definitions
+├── extract.c             # ZIP extraction logic
+├── extract.h             # Extraction header
+├── gui.c                 # GUI implementation (Win32 API)
+├── gui.h                 # GUI header with window messages
+├── main.c                # Entry point, CLI/GUI detection
+├── Makefile              # Build configuration
+├── bin/
+│   └── dezipper.exe      # Compiled executable
+├── docs/
+│   └── README.md         # This file
 └── (test files...)
 ```
 
 ## Technical Details
 
+### Architecture
+
+The project has been refactored from a single-file design into a modular architecture:
+
+- **common.c/h**: Shared utilities for path manipulation, string operations, and common types
+- **extract.c/h**: Core ZIP extraction logic including local file header parsing and deflation
+- **gui.c/h**: Windows GUI implementation with proper message handling
+- **main.c**: Application entry point with CLI/GUI mode detection
+
 ### ZIP Format Support
 - Standard ZIP (non-ZIP64)
 - Local file header parsing
 - Central directory detection
-- CRC-32 verification (optional)
+- CRC-32 verification
+- Deflate decompression using zlib
 
 ### Windows Integration
-- Uses Win32 API for GUI
+- Uses Win32 API for GUI (CreateWindow, SendMessage)
+- Native file dialog (GetOpenFileName)
 - CreateDirectory for folder structure
 - SetFileTime for timestamp preservation
 - SetEndOfFile for file truncation
@@ -126,6 +156,14 @@ Dezipper/
 - Dynamic buffer allocation for file data
 - Entry tracking for truncation
 - Proper cleanup on errors
+- Thread-safe extraction with PostMessage progress updates
+
+### GUI Implementation
+- Custom dark theme with RGB(0x1a, 0x2a, 0x4a) background
+- Custom fonts (Segoe UI, bold title)
+- Separate brushes for different control types (background, edit, button)
+- Threaded extraction with WM_EXTRACTION_* messages
+- Proper resource cleanup (fonts, brushes) in WM_DESTROY
 
 ## Limitations & Notes
 
@@ -136,6 +174,7 @@ Dezipper/
 
 ## History
 
+- **v2.0.0**: Major refactoring into modular architecture (common.c, extract.c, gui.c, main.c). Improved GUI theming with proper checkbox rendering and resource cleanup.
 - **v1.0.0**: Initial release with CLI, GUI, password support, and truncation functionality
 
 ## License
