@@ -13,6 +13,7 @@ typedef struct {
     HWND hProgressText;
     HWND hProgressReal;
     HWND hExtractButton;
+    HWND hPauseButton;
     HWND hBrowseButton;
     HWND hQuitButton;
     HWND hCheckKeep;

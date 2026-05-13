@@ -11,6 +11,8 @@
 #include <winioctl.h>
 #include <commctrl.h>
 
+extern volatile int g_extraction_stop;
+
 extern int create_directory(const char *path);
 extern void normalize_path(char *path);
 extern int file_exists(const char *path);
@@ -152,6 +154,12 @@ DWORD WINAPI ExtractionThreadProc(LPVOID lpParam) {
     fseek64(zip_file, (long long)cd_offset, SEEK_SET);
 
     for (unsigned long long i = 0; i < total_entries; i++) {
+        if (g_extraction_stop) {
+            fclose(zip_file);
+            PostMessage(params->hwnd, WM_EXTRACTION_COMPLETE, 0, (LPARAM)strdup("Extraction paused."));
+            free(params);
+            return 0;
+        }
         unsigned char cd[46];
         if (fread(cd, 1, 46, zip_file) != 46) break;
         if (cd[0] != 'P' || cd[1] != 'K' || cd[2] != 0x01 || cd[3] != 0x02) break;
@@ -333,12 +341,17 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             HWND hExtract = CreateWindow("BUTTON", "Extract ZIP", 
                 WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP,
-                25, 305, 155, 40, hwnd, (HMENU)6, NULL, NULL);
+                25, 305, 120, 40, hwnd, (HMENU)6, NULL, NULL);
             SendMessage(hExtract, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
+
+            HWND hPause = CreateWindow("BUTTON", "Pause", 
+                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP,
+                150, 305, 120, 40, hwnd, (HMENU)12, NULL, NULL);
+            SendMessage(hPause, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
 
             HWND hQuit = CreateWindow("BUTTON", "Exit", 
                 WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-                195, 305, 80, 40, hwnd, (HMENU)7, NULL, NULL);
+                275, 305, 80, 40, hwnd, (HMENU)7, NULL, NULL);
             SendMessage(hQuit, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
 
             HWND hStatus = CreateWindow("STATIC", "", WS_VISIBLE | WS_CHILD | SS_LEFTNOWORDWRAP,

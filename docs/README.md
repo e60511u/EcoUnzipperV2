@@ -1,6 +1,6 @@
 # Dezipper - ZIP Extractor & Disk Space Saver
 
-**Version**: 2.2.0
+**Version**: 2.3.0
 
 Dezipper is a high-performance Windows utility that extracts ZIP files while actively freeing disk space. Unlike traditional extractors, it uses advanced NTFS features to reclaim space from the original ZIP file during the extraction process.
 
@@ -10,7 +10,8 @@ Dezipper is a high-performance Windows utility that extracts ZIP files while act
 - **Robust ZIP Extraction**: Uses standard Central Directory parsing for 100% reliability.
 - **ZIP64 Support**: Handles "huge" archives and files exceeding 4GB.
 - **Real-time Space Recovery**: Utilizes **NTFS Sparse Files** to zero out and reclaim disk blocks *while* extracting.
-- **Final Truncation**: Automatically removes all file data from the original ZIP after extraction, leaving only a tiny "shell" file.
+- **Pause & Resume**: Supports pausing extraction and restarting later; already-extracted files are automatically skipped.
+- **Auto-Cleanup**: Automatically deletes the ZIP archive once extraction and space reclamation are complete (unless `-k` is used).
 - **Multi-file & Directory Support**: Recreates complex folder structures accurately.
 - **CRC-32 Validation**: Verifies file integrity during extraction.
 
@@ -24,8 +25,9 @@ Dezipper is a high-performance Windows utility that extracts ZIP files while act
 | `-h, --help` | Show help message |
 | `-v, --verbose` | Show detailed progress |
 | `-q, --quiet` | Suppress output |
+| `-P, --progress` | Show text-based progress bar |
 | `-d, --dir <path>` | Extract to specified directory |
-| `-k, --keep` | Keep original ZIP (don't truncate/sparse) |
+| `-k, --keep` | Keep original ZIP (don't truncate/delete) |
 | `-f, --force` | Overwrite existing files |
 | `-l, --list` | List contents only |
 | `-t, --test` | Test archive integrity (CRC) |
@@ -34,9 +36,10 @@ Dezipper is a high-performance Windows utility that extracts ZIP files while act
 
 ### GUI Features
 - **Optimized Layout**: Wide-screen interface (550x480) for long file paths.
+- **Progress Tracking**: Real-time progress bar shows extraction percentage relative to total uncompressed size.
+- **Pause Capability**: Stop extraction mid-way and resume later.
 - **Modern Dark Theme**: Custom dark blue background with high-contrast text.
 - **Native Integration**: Windows file browser and threaded processing (UI stays responsive).
-- **Intelligent Progress**: Non-wrapping progress labels for clean readability during long operations.
 - **Functional Options**: Fully working checkboxes for Keep ZIP, Preserve timestamps, and Force overwrite.
 
 ## How It Works (Space Saving)
@@ -47,7 +50,7 @@ Dezipper is a high-performance Windows utility that extracts ZIP files while act
    - Extracts the compressed data to the destination.
    - Immediately "punches" a hole in the original ZIP by zeroing the used data blocks.
    - The OS reclaims physical disk space instantly as the extraction progresses.
-4. **Final Truncation**: Once complete, the file is truncated at the Central Directory start, leaving a near-zero byte file.
+4. **Final Truncation & Deletion**: Once complete, the file is truncated and then deleted from the disk, freeing 100% of the archive's footprint.
 
 ## Build Requirements
 
@@ -57,11 +60,16 @@ Dezipper is a high-performance Windows utility that extracts ZIP files while act
 
 ### Compilation
 ```bash
-gcc -Wall -Wextra -o bin/dezipper.exe common.c extract.c gui.c main.c -lz -lgdi32 -luser32 -lcomdlg32 -mwindows
+gcc -Wall -Wextra -o bin/dezipper.exe common.c extract.c gui.c main.c -lz -lgdi32 -luser32 -lcomdlg32 -lcomctl32 -mwindows
 ```
 
 ## History
 
+- **v2.3.0**:
+  - Added CLI text-based progress bar (`-P`).
+  - Added GUI visual progress bar.
+  - Implemented Pause/Resume functionality.
+  - Added automatic ZIP file deletion after extraction.
 - **v2.2.0**: 
   - Implemented **NTFS Sparse File** support for real-time space reclamation.
   - Added full **ZIP64** support (archives > 4GB).

@@ -5,6 +5,8 @@
 #include <zlib.h>
 #include <io.h>
 
+volatile int g_extraction_stop = 0;
+
 #ifdef _WIN32
 #define fseek64 fseeko64
 #define ftell64 ftello64
@@ -298,6 +300,8 @@ int extract_zip(const char *zip_path, Options *opts) {
     fseek64(zip_file, (long long)cd_offset, SEEK_SET);
 
     for (unsigned long long i = 0; i < total_entries; i++) {
+        if (g_extraction_stop) break;
+
         unsigned char cd[46];
         if (fread(cd, 1, 46, zip_file) != 46) break;
         if (cd[0] != 'P' || cd[1] != 'K' || cd[2] != 0x01 || cd[3] != 0x02) break;
@@ -354,12 +358,6 @@ int extract_zip(const char *zip_path, Options *opts) {
         unsigned long long data_offset = local_offset + 30 + lfh_name_len + lfh_extra_len;
         fseek64(zip_file, (long long)(lfh_name_len + lfh_extra_len), SEEK_CUR);
 
-        if (opts->show_progress) {
-            render_cli_progress_bar(total_extracted_bytes, total_uncompressed_size);
-        } else if (!opts->quiet) {
-            printf("  extracting: %s\n", filename);
-        }
-
         char output_path[MAX_PATH_LEN];
         snprintf(output_path, MAX_PATH_LEN, "%s\\%s", output_dir, filename);
         normalize_path(output_path);
@@ -367,7 +365,13 @@ int extract_zip(const char *zip_path, Options *opts) {
         if (!opts->force_overwrite && file_exists(output_path)) {
             if (opts->verbose) printf("  skipping: %s (already exists)\n", filename);
             total_extracted_bytes += uncomp_size;
+            entry_count++;
         } else {
+            if (opts->show_progress) {
+                render_cli_progress_bar(total_extracted_bytes, total_uncompressed_size);
+            } else if (!opts->quiet) {
+                printf("  extracting: %s\n", filename);
+            }
             if (extract_entry(zip_file, filename, name_len, method, comp_size, uncomp_size, mod_time, mod_date, output_dir, opts->preserve_time)) {
                 entry_count++;
                 total_extracted_bytes += uncomp_size;
