@@ -27,6 +27,22 @@ void free_disk_space(HANDLE hFile, unsigned long long offset, unsigned long long
     DeviceIoControl(hFile, FSCTL_SET_ZERO_DATA, &fzdi, sizeof(fzdi), NULL, 0, &dwTemp, NULL);
 }
 
+void render_cli_progress_bar(unsigned long long current, unsigned long long total) {
+    if (total == 0) return;
+    int width = 50;
+    float progress = (float)current / total;
+    int pos = (int)(width * progress);
+
+    printf("\r[");
+    for (int i = 0; i < width; ++i) {
+        if (i < pos) printf("=");
+        else if (i == pos) printf(">");
+        else printf(" ");
+    }
+    printf("] %3d%% (%I64u/%I64u bytes)", (int)(progress * 100), current, total);
+    fflush(stdout);
+}
+
 int extract_entry(FILE *zip_file, char *filename, unsigned int filename_length,
                   unsigned short compression_method, unsigned long long compressed_size,
                   unsigned long long uncompressed_size, unsigned short last_mod_time,
@@ -247,6 +263,38 @@ int extract_zip(const char *zip_path, Options *opts) {
     }
 
     int entry_count = 0;
+    unsigned long long total_extracted_bytes = 0;
+    unsigned long long total_uncompressed_size = 0;
+
+    if (opts->show_progress) {
+        fseek64(zip_file, (long long)cd_offset, SEEK_SET);
+        for (unsigned long long i = 0; i < total_entries; i++) {
+            unsigned char cd[46];
+            if (fread(cd, 1, 46, zip_file) != 46) break;
+            unsigned long long uncomp = READ_LE32(cd + 24);
+            unsigned short name_len = READ_LE16(cd + 28);
+            unsigned short extra_len = READ_LE16(cd + 30);
+            unsigned short comment_len = READ_LE16(cd + 32);
+
+            if (uncomp == 0xFFFFFFFF) {
+                fseek64(zip_file, (long long)name_len, SEEK_CUR);
+                unsigned char *extra = (unsigned char *)malloc(extra_len);
+                fread(extra, 1, extra_len, zip_file);
+                for (int e = 0; e < extra_len - 4; ) {
+                    unsigned short tag = READ_LE16(extra + e);
+                    unsigned short tsize = READ_LE16(extra + e + 2);
+                    if (tag == 0x0001) { uncomp = READ_LE64(extra + e + 4); break; }
+                    e += 4 + tsize;
+                }
+                free(extra);
+                fseek64(zip_file, (long long)comment_len, SEEK_CUR);
+            } else {
+                fseek64(zip_file, (long long)(name_len + extra_len + comment_len), SEEK_CUR);
+            }
+            total_uncompressed_size += uncomp;
+        }
+    }
+
     fseek64(zip_file, (long long)cd_offset, SEEK_SET);
 
     for (unsigned long long i = 0; i < total_entries; i++) {
@@ -306,7 +354,11 @@ int extract_zip(const char *zip_path, Options *opts) {
         unsigned long long data_offset = local_offset + 30 + lfh_name_len + lfh_extra_len;
         fseek64(zip_file, (long long)(lfh_name_len + lfh_extra_len), SEEK_CUR);
 
-        if (!opts->quiet) printf("  extracting: %s\n", filename);
+        if (opts->show_progress) {
+            render_cli_progress_bar(total_extracted_bytes, total_uncompressed_size);
+        } else if (!opts->quiet) {
+            printf("  extracting: %s\n", filename);
+        }
 
         char output_path[MAX_PATH_LEN];
         snprintf(output_path, MAX_PATH_LEN, "%s\\%s", output_dir, filename);
@@ -314,9 +366,11 @@ int extract_zip(const char *zip_path, Options *opts) {
 
         if (!opts->force_overwrite && file_exists(output_path)) {
             if (opts->verbose) printf("  skipping: %s (already exists)\n", filename);
+            total_extracted_bytes += uncomp_size;
         } else {
             if (extract_entry(zip_file, filename, name_len, method, comp_size, uncomp_size, mod_time, mod_date, output_dir, opts->preserve_time)) {
                 entry_count++;
+                total_extracted_bytes += uncomp_size;
                 if (!opts->keep_zip && comp_size > 0) {
                     free_disk_space(hZip, data_offset, comp_size);
                 }
@@ -327,6 +381,11 @@ int extract_zip(const char *zip_path, Options *opts) {
         fseek64(zip_file, (long long)next_cd, SEEK_SET);
     }
 
+    if (opts->show_progress) {
+        render_cli_progress_bar(total_uncompressed_size, total_uncompressed_size);
+        printf("\n");
+    }
+
     if (!opts->keep_zip) {
         LARGE_INTEGER li;
         li.QuadPart = (LONGLONG)cd_offset;
@@ -335,5 +394,10 @@ int extract_zip(const char *zip_path, Options *opts) {
     }
 
     fclose(zip_file);
+
+    if (!opts->keep_zip) {
+        DeleteFile(zip_path);
+    }
+
     return entry_count;
 }

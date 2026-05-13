@@ -10,7 +10,8 @@
 
 typedef struct {
     HWND hStaticStatus;
-    HWND hProgressBar;
+    HWND hProgressText;
+    HWND hProgressReal;
     HWND hExtractButton;
     HWND hBrowseButton;
     HWND hQuitButton;
@@ -20,6 +21,7 @@ typedef struct {
     HWND hEditPath;
     HWND hPassEdit;
     int is_extracting;
+    int first_progress;
 } GUIControls;
 
 typedef struct {

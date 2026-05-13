@@ -110,6 +110,7 @@ void print_usage(const char *prog_name) {
     printf("  -l, --list        List contents without extracting\n");
     printf("  -t, --test        Test archive integrity (verify CRC)\n");
     printf("  -p, --preserve    Preserve file timestamps\n");
+    printf("  -P, --progress    Show progress bar\n");
     printf("  -x, --password    Password for encrypted ZIP files\n");
 }
 
@@ -122,6 +123,7 @@ int parse_arguments(int argc, char *argv[], Options *opts, const char **zip_path
         }
         else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) opts->verbose = 1;
         else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) opts->quiet = 1;
+        else if (strcmp(argv[i], "-P") == 0 || strcmp(argv[i], "--progress") == 0) opts->show_progress = 1;
         else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--dir") == 0) {
             if (i + 1 >= argc) { fprintf(stderr, "Error: -d requires a directory argument\n"); return -1; }
             opts->output_dir = argv[++i];

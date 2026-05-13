@@ -51,6 +51,7 @@ typedef struct {
     int preserve_time;
     int verbose;
     int quiet;
+    int show_progress;
 } Options;
 
 int create_directory(const char *path);

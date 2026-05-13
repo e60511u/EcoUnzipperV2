@@ -1,3 +1,5 @@
+#define _WIN32_IE 0x0300
+#define _WIN32_WINNT 0x0501
 #include "gui.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +9,7 @@
 #include <commdlg.h>
 #include <windows.h>
 #include <winioctl.h>
+#include <commctrl.h>
 
 extern int create_directory(const char *path);
 extern void normalize_path(char *path);
@@ -111,6 +114,41 @@ DWORD WINAPI ExtractionThreadProc(LPVOID lpParam) {
 
     int entry_count = 0;
     unsigned long long total_extracted = 0;
+    unsigned long long total_uncompressed_size = 0;
+
+    // First pass: calculate total uncompressed size for progress bar
+    fseek64(zip_file, (long long)cd_offset, SEEK_SET);
+    for (unsigned long long i = 0; i < total_entries; i++) {
+        unsigned char cd[46];
+        if (fread(cd, 1, 46, zip_file) != 46) break;
+        if (cd[0] != 'P' || cd[1] != 'K' || cd[2] != 0x01 || cd[3] != 0x02) break;
+        
+        unsigned long long uncomp = READ_LE32(cd + 24);
+        unsigned short extra_len = READ_LE16(cd + 30);
+        unsigned short comment_len = READ_LE16(cd + 32);
+        unsigned short name_len = READ_LE16(cd + 28);
+
+        if (uncomp == 0xFFFFFFFF) {
+            fseek64(zip_file, (long long)name_len, SEEK_CUR);
+            unsigned char *extra = (unsigned char *)malloc(extra_len);
+            fread(extra, 1, extra_len, zip_file);
+            for (int e = 0; e < extra_len - 4; ) {
+                unsigned short tag = READ_LE16(extra + e);
+                unsigned short tsize = READ_LE16(extra + e + 2);
+                if (tag == 0x0001) {
+                    uncomp = READ_LE64(extra + e + 4);
+                    break;
+                }
+                e += 4 + tsize;
+            }
+            free(extra);
+            fseek64(zip_file, (long long)comment_len, SEEK_CUR);
+        } else {
+            fseek64(zip_file, (long long)(name_len + extra_len + comment_len), SEEK_CUR);
+        }
+        total_uncompressed_size += uncomp;
+    }
+
     fseek64(zip_file, (long long)cd_offset, SEEK_SET);
 
     for (unsigned long long i = 0; i < total_entries; i++) {
@@ -173,7 +211,14 @@ DWORD WINAPI ExtractionThreadProc(LPVOID lpParam) {
         char *progress_msg = (char *)malloc(256);
         if (progress_msg) {
             snprintf(progress_msg, 256, "Extracting: %s", filename);
-            PostMessage(params->hwnd, WM_EXTRACTION_PROGRESS, (WPARAM)entry_count, (LPARAM)progress_msg);
+            // On first entry, send total_uncompressed_size (cast to WPARAM if it fits, or handled differently)
+            // Actually, let's just use a simple percentage or absolute values.
+            // We'll use WPARAM for entry_count and LPARAM for msg.
+            // But we need to communicate total_uncompressed_size to the UI.
+            // Let's send a special message or use the first progress message.
+            WPARAM wp = (i == 0) ? (WPARAM)(total_uncompressed_size >> 10) : (WPARAM)(total_extracted >> 10);
+            if (i == 0 && wp == 0 && total_uncompressed_size > 0) wp = 1; 
+            PostMessage(params->hwnd, WM_EXTRACTION_PROGRESS, wp, (LPARAM)progress_msg);
         }
 
         char output_path[MAX_PATH_LEN];
@@ -203,6 +248,10 @@ DWORD WINAPI ExtractionThreadProc(LPVOID lpParam) {
         SetEndOfFile(hZip);
     }
     fclose(zip_file);
+
+    if (!params->keep_zip) {
+        DeleteFile(params->zip_path);
+    }
 
     char *msg = (char *)malloc(512);
     if (msg) {
@@ -296,9 +345,18 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 25, 360, 470, 20, hwnd, (HMENU)8, NULL, NULL);
             SendMessage(hStatus, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
 
-            HWND hProgress = CreateWindow("STATIC", "", WS_VISIBLE | WS_CHILD | SS_LEFTNOWORDWRAP,
+            HWND hProgressText = CreateWindow("STATIC", "", WS_VISIBLE | WS_CHILD | SS_LEFTNOWORDWRAP,
                 25, 385, 470, 18, hwnd, (HMENU)9, NULL, NULL);
-            SendMessage(hProgress, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
+            SendMessage(hProgressText, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
+
+            // Add real progress bar
+            INITCOMMONCONTROLSEX icex;
+            icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
+            icex.dwICC = ICC_PROGRESS_CLASS;
+            InitCommonControlsEx(&icex);
+
+            HWND hProgressReal = CreateWindowEx(0, PROGRESS_CLASS, "", WS_VISIBLE | WS_CHILD,
+                25, 410, 470, 20, hwnd, (HMENU)11, NULL, NULL);
 
             controls = (GUIControls *)malloc(sizeof(GUIControls));
             memset(controls, 0, sizeof(GUIControls));
@@ -311,7 +369,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             controls->hExtractButton = hExtract;
             controls->hQuitButton = hQuit;
             controls->hStaticStatus = hStatus;
-            controls->hProgressBar = hProgress;
+            controls->hProgressText = hProgressText;
+            controls->hProgressReal = hProgressReal;
             controls->is_extracting = 0;
 
             SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)controls);
@@ -348,8 +407,16 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_EXTRACTION_PROGRESS: {
             if (controls && lParam) {
                 char *progress_msg = (char *)lParam;
-                SetWindowText(controls->hProgressBar, progress_msg);
+                SetWindowText(controls->hProgressText, progress_msg);
                 free(progress_msg);
+
+                if (controls->first_progress) {
+                    SendMessage(controls->hProgressReal, PBM_SETRANGE32, 0, (LPARAM)wParam);
+                    SendMessage(controls->hProgressReal, PBM_SETPOS, 0, 0);
+                    controls->first_progress = 0;
+                } else {
+                    SendMessage(controls->hProgressReal, PBM_SETPOS, (WPARAM)wParam, 0);
+                }
             }
             break;
         }
@@ -360,7 +427,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 EnableWindow(controls->hExtractButton, TRUE);
                 EnableWindow(controls->hBrowseButton, TRUE);
                 SetWindowText(controls->hStaticStatus, "Extraction complete!");
-                SetWindowText(controls->hProgressBar, "");
+                SetWindowText(controls->hProgressText, "");
+                SendMessage(controls->hProgressReal, PBM_SETPOS, 0, 0);
                 if (lParam) {
                     MessageBox(hwnd, (char *)lParam, "Dezipper", MB_OK | MB_ICONINFORMATION);
                     free((char *)lParam);
@@ -375,7 +443,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 EnableWindow(controls->hExtractButton, TRUE);
                 EnableWindow(controls->hBrowseButton, TRUE);
                 SetWindowText(controls->hStaticStatus, "Extraction failed!");
-                SetWindowText(controls->hProgressBar, "");
+                SetWindowText(controls->hProgressText, "");
+                SendMessage(controls->hProgressReal, PBM_SETPOS, 0, 0);
                 if (lParam) {
                     MessageBox(hwnd, (char *)lParam, "Dezipper Error", MB_OK | MB_ICONERROR);
                     free((char *)lParam);
@@ -427,8 +496,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 EnableWindow(controls->hExtractButton, FALSE);
                 EnableWindow(controls->hBrowseButton, FALSE);
                 controls->is_extracting = 1;
+                controls->first_progress = 1; // Reset progress bar range flag
                 SetWindowText(controls->hStaticStatus, "Starting extraction...");
-                SetWindowText(controls->hProgressBar, "Initializing...");
+                SetWindowText(controls->hProgressText, "Initializing...");
+                SendMessage(controls->hProgressReal, PBM_SETPOS, 0, 0);
 
                 ExtractionParams *params = (ExtractionParams *)malloc(sizeof(ExtractionParams));
                 strncpy(params->zip_path, path, MAX_PATH - 1);
